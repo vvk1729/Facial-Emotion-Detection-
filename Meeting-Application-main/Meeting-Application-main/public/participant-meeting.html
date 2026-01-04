@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Join Meeting</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+</head>
+<body class="bg-gray-900">
+    <div class="video-container bg-gray-900 min-h-screen p-2">
+        <div class="w-full h-screen flex flex-col">
+
+            <!-- Participant Header -->
+            <div class="bg-slate-700 p-2 rounded-lg flex-shrink-0">
+                <h1 class="text-lg text-white font-bold">👥 PARTICIPANT - <span id="roomName" class="text-yellow-300"></span> | Name: <span id="participantName" class="font-bold"></span> | Participants: <span id="participantCount" class="font-bold">1</span>/6</h1>
+                
+                <!-- View Toggle -->
+                <div class="mt-1 flex gap-2">
+                    <button id="viewHost" class="px-3 py-1 bg-slate-700 text-white rounded-full font-bold text-sm hover:bg-slate-600">
+                        👤 Host Screen
+                    </button>
+                    <button id="viewAll" class="px-3 py-1 bg-slate-700 text-white rounded-full text-sm hover:bg-slate-600">
+                        👥 All Members
+                    </button>
+                </div>
+            </div>
+            
+            <div id="videoGrid" class="flex-1 grid grid-cols-3 grid-rows-2 gap-3 mt-2 mb-3 px-40 overflow-hidden" style="height: calc(100vh - 160px);">
+                <!-- Videos will be added here dynamically -->
+            </div>
+
+            <div class="flex justify-center gap-2 flex-wrap pb-2 flex-shrink-0">
+                <button id="toggleAudio" class="px-3 py-2 bg-slate-700 text-white rounded-full hover:bg-slate-600 text-sm">
+                    🎤 Mute
+                </button>
+                <button id="toggleVideo" class="px-3 py-2 bg-slate-700 text-white rounded-full hover:bg-slate-600 text-sm">
+                    📹 Stop Video
+                </button>
+                <button id="shareScreen" class="px-3 py-2 bg-slate-700 text-white rounded-full hover:bg-slate-600 text-sm">
+                    🖥️ Share Screen
+                </button>
+                <button id="hangUp" class="px-3 py-2 bg-slate-700 text-white rounded-full hover:bg-slate-600 text-sm">
+                    📞 Leave Meeting
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Get room from URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const roomName = urlParams.get('room');
+        
+        // Prompt for name if not provided
+        let participantName = urlParams.get('name') || prompt('Enter your name:') || 'Guest';
+
+        document.getElementById('roomName').textContent = roomName;
+        document.getElementById('participantName').textContent = participantName;
+
+        // Connect to Socket.IO
+        const socket = io();
+        let localStream;
+        let screenStream;
+        let peerConnections = {};
+        let participants = new Set();
+        let isSharingScreen = false;
+
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        };
+
+        // Store local video element separately
+        let localVideoElement = null;
+
+        // Get user media
+        async function startLocalStream() {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: true,
+                    audio: true
+                });
+                
+                // Create local video but don't add to grid yet (only in "All Members" view)
+                const container = document.createElement('div');
+                container.id = 'video-local';
+                container.className = 'relative';
+                
+                const video = document.createElement('video');
+                video.autoplay = true;
+                video.playsinline = true;
+                video.muted = true;
+                // video.className = 'w-full rounded-xl bg-gray-800 border-4 border-green-600';
+                video.className = 'w-full h-full rounded-xl bg-gray-800 border-4 border-green-600';
+                video.style.objectFit = 'cover';
+
+                video.srcObject = localStream;
+                
+                const label = document.createElement('div');
+                label.className = 'absolute bottom-2 left-2 bg-black bg-opacity-50 text-white px-2 py-1 rounded text-sm';
+                label.textContent = participantName + ' (You)';
+                
+                container.appendChild(video);
+                container.appendChild(label);
+                localVideoElement = container;
+                
+                // Don't add to participants set yet - wait for server confirmation
+                updateParticipantCount();
+                
+                socket.emit('join-room', { room: roomName, name: participantName, isHost: false });
+            } catch (error) {
+                alert('Cannot access camera/microphone: ' + error.message);
+            }
+        }
+
+        // Store all remote video elements separately
+        let remoteVideoElements = new Map();
+
+        function addVideoElement(id, name, stream, isLocal = false) {
+            // Only create if stream has tracks
+            if (!stream || stream.getTracks().length === 0) {
+                console.log('Skipping video element - no tracks in stream for', name);
+                return;
+            }
+            
+            // Double check for active tracks
+            const hasActiveVideo = stream.getVideoTracks().some(track => track.enabled && track.readyState === 'live');
+            const hasActiveAudio = stream.getAudioTracks().some(track => track.enabled && track.readyState === 'live');
+            
+            if (!hasActiveVideo && !hasActiveAudio) {
+                console.log('Skipping video element - no active tracks for', name);
+                return;
+            }
+            
+            const container = document.createElement('div');
+            container.id = 'video-' + id;
+            container.className = 'relative w-full h-full flex items-center justify-center';
+            
+            const video = document.createElement('video');
+            video.autoplay = true;
+            video.playsinline = true;
+            if (isLocal) video.muted = true;
+            video.className = 'w-full h-full rounded-lg bg-gray-800 border-2 ' + (isLocal && !isSharingScreen ? 'border-green-600' : isLocal ? 'border-blue-600' : 'border-purple-600');
+            video.style.objectFit = 'contain';
+            video.srcObject = stream;
+            
+            const label = document.createElement('div');
+            label.className = 'absolute bottom-2 left-2 bg-black bg-opacity-50 text-white px-2 py-1 rounded text-sm';
+            label.textContent = name;
+            
+            container.appendChild(video);
+            container.appendChild(label);
+            
+            // Store remote videos
+            if (!isLocal) {
+                remoteVideoElements.set(id, container);
+                participants.add(id);
+                updateParticipantCount();
+            }
+            
+            // Apply current view mode
+            applyViewMode();
+        }
+
+        function removeVideoElement(id) {
+            remoteVideoElements.delete(id);
+            participants.delete(id);
+            updateParticipantCount();
+            applyViewMode();
+        }
+
+        function updateParticipantCount() {
+            // Count: participants.size + 1 (yourself)
+            const totalCount = participants.size + 1;
+            document.getElementById('participantCount').textContent = totalCount;
+        }
+
+        // Approval state
+        let isApproved = false;
+        let waitingScreen = null;
+        let currentView = 'host'; // 'host' or 'all'
+        let hostSocketId = null;
+
+        // Socket handlers
+        socket.on('waiting-approval', (data) => {
+            console.log('Waiting for approval...');
+            waitingScreen = document.createElement('div');
+            waitingScreen.className = 'fixed inset-0 bg-gray-900 flex items-center justify-center z-50';
+            waitingScreen.innerHTML = `
+                <div class="text-center">
+                    <h1 class="text-3xl text-white font-bold mb-4">⏳ Waiting for Host Approval...</h1>
+                    <p class="text-gray-400">The host will let you in soon</p>
+                    <div class="mt-6">
+                        <div class="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-blue-500 mx-auto"></div>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(waitingScreen);
+        });
+
+        socket.on('join-approved', async (data) => {
+            console.log('Join approved! Users:', data.users);
+            isApproved = true;
+            
+            // Remove waiting screen
+            if (waitingScreen) {
+                waitingScreen.remove();
+            }
+            
+            // Find and store host socket ID
+            for (const user of data.users) {
+                if (user.isHost) {
+                    hostSocketId = user.id;
+                    console.log('Host identified:', hostSocketId);
+                }
+            }
+            
+            // Connect to existing users
+            for (const user of data.users) {
+                if (user.id !== socket.id) {
+                    await createPeerConnection(user.id, true);
+                }
+            }
+        });
+
+        socket.on('join-denied', (data) => {
+            alert(data.message);
+            window.location.href = '/';
+        });
+
+        socket.on('force-mute', () => {
+            const audioTrack = localStream?.getAudioTracks()[0];
+            if (audioTrack) {
+                audioTrack.enabled = false;
+                const btn = document.getElementById('toggleAudio');
+                btn.textContent = '🔇 Unmuted';
+                btn.classList.add('bg-red-600');
+                btn.classList.remove('bg-gray-700');
+            }
+            alert('Host muted your microphone');
+        });
+
+        socket.on('force-mute-all', () => {
+            const audioTrack = localStream?.getAudioTracks()[0];
+            if (audioTrack) {
+                audioTrack.enabled = false;
+                const btn = document.getElementById('toggleAudio');
+                btn.textContent = '🔇 Unmuted';
+                btn.classList.add('bg-red-600');
+                btn.classList.remove('bg-gray-700');
+            }
+            alert('Host muted all participants');
+        });
+
+        socket.on('all-users', async (users) => {
+            console.log('All users in room:', users);
+            for (const user of users) {
+                if (user.id !== socket.id) {
+                    if (user.isHost) {
+                        hostSocketId = user.id;
+                    }
+                    await createPeerConnection(user.id, true);
+                }
+            }
+        });
+
+        socket.on('user-connected', async (data) => {
+            console.log('User connected:', data);
+            // Don't create connection to yourself
+            if (data.userId === socket.id) {
+                console.log('Skipping connection to self');
+                return;
+            }
+            if (data.isHost) {
+                hostSocketId = data.userId;
+            }
+            await createPeerConnection(data.userId, true);
+        });
+
+        socket.on('user-disconnected', (userId) => {
+            console.log('User disconnected:', userId);
+            if (peerConnections[userId]) {
+                peerConnections[userId].close();
+                delete peerConnections[userId];
+            }
+            removeVideoElement(userId);
+        });
+
+        socket.on('offer', async (data) => {
+            console.log('Received offer from:', data.from);
+            if (!peerConnections[data.from]) {
+                await createPeerConnection(data.from, false);
+            }
+            await peerConnections[data.from].setRemoteDescription(new RTCSessionDescription(data.offer));
+            const answer = await peerConnections[data.from].createAnswer();
+            await peerConnections[data.from].setLocalDescription(answer);
+            socket.emit('answer', { room: roomName, to: data.from, answer: answer });
+        });
+
+        socket.on('answer', async (data) => {
+            console.log('Received answer from:', data.from);
+            if (peerConnections[data.from]) {
+                await peerConnections[data.from].setRemoteDescription(new RTCSessionDescription(data.answer));
+            }
+        });
+
+        socket.on('ice-candidate', async (data) => {
+            console.log('Received ICE candidate from:', data.from);
+            if (peerConnections[data.from]) {
+                await peerConnections[data.from].addIceCandidate(new RTCIceCandidate(data.candidate));
+            }
+        });
+
+        async function createPeerConnection(userId, shouldCreateOffer) {
+            const pc = new RTCPeerConnection(configuration);
+            peerConnections[userId] = pc;
+            
+            // Add local stream tracks
+            const streamToSend = isSharingScreen ? screenStream : localStream;
+            streamToSend.getTracks().forEach(track => {
+                pc.addTrack(track, streamToSend);
+            });
+
+            // Handle remote stream - use event.streams for complete stream
+            pc.ontrack = (event) => {
+                console.log('Received remote track from:', userId, 'Kind:', event.track.kind);
+                
+                // Use the stream from the event which already has all tracks
+                if (event.streams && event.streams[0]) {
+                    const remoteStream = event.streams[0];
+                    
+                    // Check if we already have a video element for this user
+                    if (!remoteVideoElements.has(userId)) {
+                        const isHostUser = (userId === hostSocketId);
+                        const name = isHostUser ? '🎯 Host' : 'Participant';
+                        addVideoElement(userId, name, remoteStream, false);
+                        console.log('Created video element for', name, 'with stream:', remoteStream.id);
+                    } else {
+                        // Update existing video element's stream
+                        const container = remoteVideoElements.get(userId);
+                        const video = container.querySelector('video');
+                        if (video) {
+                            video.srcObject = remoteStream;
+                            console.log('Updated stream for user', userId);
+                        }
+                    }
+                }
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    socket.emit('ice-candidate', { 
+                        room: roomName,
+                        to: userId,
+                        candidate: event.candidate 
+                    });
+                }
+            };
+
+            if (shouldCreateOffer) {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                socket.emit('offer', { room: roomName, to: userId, offer: offer });
+            }
+
+            return pc;
+        }
+
+        // Screen sharing
+        document.getElementById('shareScreen').addEventListener('click', async () => {
+            if (!isSharingScreen) {
+                try {
+                    screenStream = await navigator.mediaDevices.getDisplayMedia({ 
+                        video: true,
+                        audio: true 
+                    });
+                    
+                    // Replace video track in all peer connections
+                    const videoTrack = screenStream.getVideoTracks()[0];
+                    const audioTrack = screenStream.getAudioTracks()[0];
+                    
+                    Object.values(peerConnections).forEach(pc => {
+                        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+                        if (sender) sender.replaceTrack(videoTrack);
+                        
+                        if (audioTrack) {
+                            const audioSender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+                            if (audioSender) audioSender.replaceTrack(audioTrack);
+                        }
+                    });
+                    
+                    // Update local video
+                    const localVideo = document.querySelector('#video-local video');
+                    if (localVideo) {
+                        localVideo.srcObject = screenStream;
+                        localVideo.className = 'w-full rounded-xl bg-gray-800 border-4 border-blue-600';
+                    }
+                    
+                    isSharingScreen = true;
+                    document.getElementById('shareScreen').textContent = '🖥️ Stop Sharing';
+                    document.getElementById('shareScreen').classList.add('bg-red-600');
+                    
+                    // Stop sharing when user clicks stop
+                    videoTrack.onended = () => stopScreenShare();
+                    
+                } catch (error) {
+                    alert('Cannot share screen: ' + error.message);
+                }
+            } else {
+                stopScreenShare();
+            }
+        });
+
+        function stopScreenShare() {
+            if (screenStream) {
+                screenStream.getTracks().forEach(track => track.stop());
+            }
+            
+            // Replace back to camera
+            const videoTrack = localStream.getVideoTracks()[0];
+            const audioTrack = localStream.getAudioTracks()[0];
+            
+            Object.values(peerConnections).forEach(pc => {
+                const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+                if (sender) sender.replaceTrack(videoTrack);
+                
+                const audioSender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+                if (audioSender) audioSender.replaceTrack(audioTrack);
+            });
+            
+            // Update local video
+            const localVideo = document.querySelector('#video-local video');
+            if (localVideo) {
+                localVideo.srcObject = localStream;
+                localVideo.className = 'w-full rounded-xl bg-gray-800 border-4 border-green-600';
+            }
+            
+            isSharingScreen = false;
+            document.getElementById('shareScreen').textContent = '🖥️ Share Screen';
+            document.getElementById('shareScreen').classList.remove('bg-red-600');
+        }
+
+        // Button controls
+        document.getElementById('toggleAudio').addEventListener('click', () => {
+            if (!localStream) return;
+            const audioTrack = localStream.getAudioTracks()[0];
+            if (audioTrack) {
+                audioTrack.enabled = !audioTrack.enabled;
+                const btn = document.getElementById('toggleAudio');
+                if (audioTrack.enabled) {
+                    btn.textContent = '🎤 Mute';
+                    btn.classList.remove('bg-red-600');
+                    btn.classList.add('bg-gray-700');
+                } else {
+                    btn.textContent = '🔇 Unmuted';
+                    btn.classList.remove('bg-gray-700');
+                    btn.classList.add('bg-red-600');
+                }
+                console.log('Microphone', audioTrack.enabled ? 'ON' : 'OFF');
+            }
+        });
+
+        document.getElementById('toggleVideo').addEventListener('click', () => {
+            if (!localStream) return;
+            const videoTrack = localStream.getVideoTracks()[0];
+            if (videoTrack) {
+                videoTrack.enabled = !videoTrack.enabled;
+                const btn = document.getElementById('toggleVideo');
+                if (videoTrack.enabled) {
+                    btn.textContent = '📹 Stop Video';
+                    btn.classList.remove('bg-red-600');
+                    btn.classList.add('bg-gray-700');
+                } else {
+                    btn.textContent = '📹 Start Video';
+                    btn.classList.remove('bg-gray-700');
+                    btn.classList.add('bg-red-600');
+                }
+                console.log('Camera', videoTrack.enabled ? 'ON' : 'OFF');
+            }
+        });
+
+        document.getElementById('hangUp').addEventListener('click', () => {
+            if (confirm('Leave the meeting?')) {
+                Object.values(peerConnections).forEach(pc => pc.close());
+                if (localStream) localStream.getTracks().forEach(track => track.stop());
+                if (screenStream) screenStream.getTracks().forEach(track => track.stop());
+                socket.disconnect();
+                window.location.href = '/';
+            }
+        });
+
+        // View switching
+        document.getElementById('viewHost').addEventListener('click', () => {
+            currentView = 'host';
+            document.getElementById('viewHost').className = 'px-3 py-1 bg-slate-700 text-white rounded-full font-bold text-sm hover:bg-slate-600';
+            document.getElementById('viewAll').className = 'px-3 py-1 bg-slate-700 text-white rounded-full text-sm hover:bg-slate-600';
+            applyViewMode();
+        });
+
+        document.getElementById('viewAll').addEventListener('click', () => {
+            currentView = 'all';
+            document.getElementById('viewHost').className = 'px-3 py-1 bg-slate-700 text-white rounded-full font-bold text-sm hover:bg-slate-600';
+            document.getElementById('viewAll').className = 'px-3 py-1 bg-slate-700 text-white rounded-full text-sm hover:bg-slate-600';
+            applyViewMode();
+        });
+
+        function applyViewMode() {
+            const videoGrid = document.getElementById('videoGrid');
+            videoGrid.innerHTML = '';
+            
+            if (currentView === 'host') {
+                // Show ONLY host video (full screen)
+                if (hostSocketId && remoteVideoElements.has(hostSocketId)) {
+                    const hostElement = remoteVideoElements.get(hostSocketId);
+                    const hostVideo = hostElement.querySelector('video');
+                    
+                    if (hostVideo && hostVideo.srcObject) {
+                        const hostContainer = document.createElement('div');
+                        hostContainer.className = 'relative w-full h-full flex items-center justify-center';
+                        
+                        const video = document.createElement('video');
+                        video.autoplay = true;
+                        video.playsinline = true;
+                        video.muted = false;
+                        video.className = 'rounded-lg bg-gray-800 border-2 border-purple-600';
+                        video.style.maxWidth = '100%';
+                        video.style.maxHeight = '100%';
+                        video.style.objectFit = 'contain';
+                        video.srcObject = hostVideo.srcObject;
+                        video.play();
+                        
+                        const label = document.createElement('div');
+                        label.className = 'absolute bottom-1 left-1 bg-black bg-opacity-50 text-white px-2 py-1 rounded text-xs font-bold';
+                        label.textContent = '🎯 Host';
+                        
+                        hostContainer.appendChild(video);
+                        hostContainer.appendChild(label);
+                        videoGrid.appendChild(hostContainer);
+                    }
+                }
+                videoGrid.className = 'flex-1 grid grid-cols-1 gap-3 mt-2 mb-3 px-40 overflow-hidden';
+                videoGrid.style.height = 'calc(100vh - 160px)';
+            } else {
+                // Show all videos including own - ONLY if they have actual video streams
+                // Add local video first
+                if (localVideoElement) {
+                    videoGrid.appendChild(localVideoElement);
+                }
+                
+                // Add only remote videos that have actual video streams
+                remoteVideoElements.forEach((element, id) => {
+                    const video = element.querySelector('video');
+                    // Only add if video has a valid stream with active tracks
+                    if (video && video.srcObject) {
+                        const tracks = video.srcObject.getTracks();
+                        const hasActiveTracks = tracks.some(track => track.enabled && track.readyState === 'live');
+                        if (tracks.length > 0 && hasActiveTracks) {
+                            videoGrid.appendChild(element);
+                        } else {
+                            console.log('Skipping inactive video for', element.querySelector('.absolute').textContent);
+                        }
+                    }
+                });
+                
+                // Always use 3 columns per row (2x3 grid for up to 6 people)
+                videoGrid.className = 'flex-1 grid grid-cols-3 grid-rows-2 gap-3 mt-2 mb-3 px-40 overflow-hidden';
+                videoGrid.style.height = 'calc(100vh - 160px)';
+            }
+        }
+
+        startLocalStream();
+
+        // ============================================
+        // EMOTION ALERT FROM HOST
+        // ============================================
+        
+        // Get emotion emoji
+        const getEmotionEmoji = (emotion) => {
+            const emotionEmojis = {
+                'happy': '😊',
+                'sad': '😢',
+                'angry': '😠',
+                'surprise': '😲',
+                'fear': '😨',
+                'disgust': '🤢',
+                'neutral': '😐'
+            };
+            return emotionEmojis[emotion] || '😊';
+        };
+
+        // Check if emotion indicates interest
+        const isInterested = (emotion) => {
+            return ['happy', 'surprise', 'neutral'].includes(emotion.toLowerCase());
+        };
+
+        // Show popup for non-interested participants
+        function showNotInterestedPopup(emotion) {
+            // Create popup overlay
+            const popup = document.createElement('div');
+            popup.className = 'fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 popup-notification';
+            
+            popup.innerHTML = `
+                <div class="bg-gradient-to-br from-red-600 to-orange-600 p-8 rounded-2xl shadow-2xl max-w-md text-center transform animate-bounce">
+                    <div class="text-6xl mb-4">${getEmotionEmoji(emotion)}</div>
+                    <h2 class="text-3xl font-bold text-white mb-4">⚠️ Attention Needed!</h2>
+                    <p class="text-xl text-white mb-2">You seem <span class="font-bold uppercase">${emotion}</span></p>
+                    <p class="text-lg text-white opacity-90 mb-6">Please pay attention to the meeting!</p>
+                    <button onclick="this.closest('.popup-notification').remove()" 
+                            class="bg-white text-red-600 px-6 py-3 rounded-full font-bold hover:bg-gray-100 transition">
+                        Got it! ✓
+                    </button>
+                </div>
+            `;
+            
+            document.body.appendChild(popup);
+            
+            // Auto-remove after 8 seconds
+            setTimeout(() => {
+                if (popup.parentNode) {
+                    popup.remove();
+                }
+            }, 5000);
+        }
+
+        // Add emotion label to video container (only name, no percentage)
+        const addEmotionLabel = (container, emotion) => {
+            // Remove existing emotion label if any
+            const existingLabel = container.querySelector('.emotion-label');
+            if (existingLabel) {
+                existingLabel.remove();
+            }
+
+            // Create new emotion label (only emoji and name)
+            const label = document.createElement('div');
+            label.className = 'emotion-label absolute top-2 right-2 bg-gradient-to-r from-purple-600 to-pink-600 text-white px-3 py-2 rounded-lg text-sm font-bold shadow-lg';
+            label.innerHTML = `${getEmotionEmoji(emotion)} ${emotion.toUpperCase()}`;
+            container.appendChild(label);
+
+            // Remove after 10 seconds
+            setTimeout(() => {
+                label.remove();
+            }, 10000);
+        };
+
+        // Show interest statistics on the right side
+        const showInterestStats = (interested, notInterested, total) => {
+            // Remove existing stats if any
+            const existingStats = document.getElementById('interestStats');
+            if (existingStats) {
+                existingStats.remove();
+            }
+
+            const interestedPercent = ((interested / total) * 100).toFixed(0);
+            const notInterestedPercent = ((notInterested / total) * 100).toFixed(0);
+
+            // Create stats display on the right side
+            const statsDiv = document.createElement('div');
+            statsDiv.id = 'interestStats';
+            statsDiv.className = 'fixed top-24 right-4 bg-gray-800 border-2 border-slate-600 text-white p-4 rounded-lg shadow-2xl z-50';
+            statsDiv.innerHTML = `
+                <div class="text-center mb-2">
+                    <h3 class="font-bold text-lg">📊 Interest Level</h3>
+                </div>
+                <div class="space-y-2">
+                    <div class="bg-slate-700 p-2 rounded">
+                        <div class="text-xs">😊 Interested</div>
+                        <div class="text-2xl font-bold">${interestedPercent}%</div>
+                    </div>
+                    <div class="bg-slate-700 p-2 rounded">
+                        <div class="text-xs">😔 Not Interested</div>
+                        <div class="text-2xl font-bold">${notInterestedPercent}%</div>
+                    </div>
+                    <div class="text-xs text-gray-400 text-center mt-2">
+                        Total: ${total} participant${total > 1 ? 's' : ''}
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(statsDiv);
+
+            // Auto-remove after 15 seconds
+            setTimeout(() => {
+                statsDiv.remove();
+            }, 15000);
+        };
+
+        // Listen for emotion alert from host
+        socket.on('emotion-alert', (data) => {
+            console.log('Received emotion alert from host:', data);
+            if (data.emotion) {
+                showNotInterestedPopup(data.emotion);
+            }
+        });
+    </script>
+</body>
+</html>

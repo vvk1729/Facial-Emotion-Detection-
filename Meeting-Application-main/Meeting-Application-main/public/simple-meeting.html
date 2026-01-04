@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple Meeting</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+</head>
+<body class="bg-gray-900">
+    <div class="video-container bg-gray-900 min-h-screen p-8">
+        <div class="w-full max-w-7xl mx-auto">
+            <div class="mb-4 text-center">
+                <h1 class="text-2xl text-white font-bold mb-2">Meeting Room: <span id="roomName" class="text-blue-400"></span></h1>
+                <p class="text-gray-400">Participant: <span id="participantName" class="text-white"></span> | Participants: <span id="participantCount" class="text-white">1</span>/6</p>
+            </div>
+            
+            <div id="videoGrid" class="grid grid-cols-3 gap-4 mb-4">
+                <!-- Videos will be added here dynamically -->
+            </div>
+            
+            <p id="waiting" class="text-gray-400 text-center mb-4">Waiting for others to join...</p>
+
+            <div class="flex justify-center gap-4">
+                <button id="toggleAudio" class="px-6 py-3 bg-gray-700 text-white rounded-full hover:bg-gray-600">
+                    🎤 Mute
+                </button>
+                <button id="toggleVideo" class="px-6 py-3 bg-gray-700 text-white rounded-full hover:bg-gray-600">
+                    📹 Stop Video
+                </button>
+                <button id="hangUp" class="px-6 py-3 bg-red-600 text-white rounded-full hover:bg-red-700">
+                    📞 Leave Meeting
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Get room and name from URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const roomName = urlParams.get('room');
+        const participantName = urlParams.get('name') || 'Guest';
+
+        document.getElementById('roomName').textContent = roomName;
+        document.getElementById('participantName').textContent = participantName;
+
+        // Connect to Socket.IO
+        const socket = io();
+        let localStream;
+        let peerConnections = {};
+        let participants = new Set();
+        
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        };
+
+        // Get user media
+        async function startLocalStream() {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: true,
+                    audio: true
+                });
+                
+                // Add local video
+                addVideoElement('local', participantName, localStream, true);
+                participants.add('local');
+                updateParticipantCount();
+                
+                // Join room
+                socket.emit('join-room', { room: roomName, name: participantName });
+            } catch (error) {
+                alert('Cannot access camera/microphone: ' + error.message);
+            }
+        }
+
+        function addVideoElement(id, name, stream, isLocal = false) {
+            // Remove if already exists
+            const existing = document.getElementById('video-' + id);
+            if (existing) existing.remove();
+
+            const videoGrid = document.getElementById('videoGrid');
+            const container = document.createElement('div');
+            container.id = 'video-' + id;
+            container.className = 'relative';
+            
+            const video = document.createElement('video');
+            video.autoplay = true;
+            video.playsinline = true;
+            if (isLocal) video.muted = true;
+            video.className = 'w-full rounded-xl bg-gray-800 border-4 ' + (isLocal ? 'border-blue-600' : 'border-green-600');
+            video.srcObject = stream;
+            
+            const label = document.createElement('div');
+            label.className = 'absolute bottom-2 left-2 bg-black bg-opacity-50 text-white px-2 py-1 rounded text-sm';
+            label.textContent = name + (isLocal ? ' (You)' : '');
+            
+            container.appendChild(video);
+            container.appendChild(label);
+            videoGrid.appendChild(container);
+        }
+
+        function removeVideoElement(id) {
+            const element = document.getElementById('video-' + id);
+            if (element) element.remove();
+            participants.delete(id);
+            updateParticipantCount();
+        }
+
+        function updateParticipantCount() {
+            document.getElementById('participantCount').textContent = participants.size;
+            document.getElementById('waiting').style.display = participants.size > 1 ? 'none' : 'block';
+        }
+
+        // Socket events
+        socket.on('user-connected', async (data) => {
+            console.log('User connected:', data.id, data.name);
+            participants.add(data.id);
+            updateParticipantCount();
+            
+            // Create peer connection for this user
+            await createPeerConnection(data.id, true);
+        });
+
+        socket.on('all-users', (users) => {
+            console.log('All users in room:', users);
+            users.forEach(user => {
+                if (user.id !== socket.id) {
+                    participants.add(user.id);
+                    createPeerConnection(user.id, false);
+                }
+            });
+            updateParticipantCount();
+        });
+
+        socket.on('user-disconnected', (userId) => {
+            console.log('User disconnected:', userId);
+            if (peerConnections[userId]) {
+                peerConnections[userId].close();
+                delete peerConnections[userId];
+            }
+            removeVideoElement(userId);
+        });
+
+        socket.on('offer', async (data) => {
+            console.log('Received offer from:', data.from);
+            if (!peerConnections[data.from]) {
+                await createPeerConnection(data.from, false);
+            }
+            await peerConnections[data.from].setRemoteDescription(new RTCSessionDescription(data.offer));
+            const answer = await peerConnections[data.from].createAnswer();
+            await peerConnections[data.from].setLocalDescription(answer);
+            socket.emit('answer', { room: roomName, to: data.from, answer: answer });
+        });
+
+        socket.on('answer', async (data) => {
+            console.log('Received answer from:', data.from);
+            if (peerConnections[data.from]) {
+                await peerConnections[data.from].setRemoteDescription(new RTCSessionDescription(data.answer));
+            }
+        });
+
+        socket.on('ice-candidate', async (data) => {
+            console.log('Received ICE candidate from:', data.from);
+            if (peerConnections[data.from]) {
+                await peerConnections[data.from].addIceCandidate(new RTCIceCandidate(data.candidate));
+            }
+        });
+
+        async function createPeerConnection(userId, shouldCreateOffer) {
+            const pc = new RTCPeerConnection(configuration);
+            peerConnections[userId] = pc;
+            
+            // Add local stream tracks
+            localStream.getTracks().forEach(track => {
+                pc.addTrack(track, localStream);
+            });
+
+            // Handle remote stream
+            pc.ontrack = (event) => {
+                console.log('Received remote track from:', userId, 'Kind:', event.track.kind);
+                
+                // Find existing video or create new one
+                const existingVideo = document.querySelector(`#video-${userId} video`);
+                if (existingVideo) {
+                    // Add track to existing stream
+                    let stream = existingVideo.srcObject;
+                    if (!stream) {
+                        stream = new MediaStream();
+                        existingVideo.srcObject = stream;
+                    }
+                    stream.addTrack(event.track);
+                    console.log('Added', event.track.kind, 'track to existing stream');
+                } else {
+                    // Create new stream with this track
+                    let remoteStream = new MediaStream([event.track]);
+                    addVideoElement(userId, 'Participant', remoteStream, false);
+                    participants.add(userId);
+                    updateParticipantCount();
+                    console.log('Created new video element with', event.track.kind, 'track');
+                }
+            };
+
+            // Handle ICE candidates
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    socket.emit('ice-candidate', { 
+                        room: roomName,
+                        to: userId,
+                        candidate: event.candidate 
+                    });
+                }
+            };
+
+            // Create offer if needed
+            if (shouldCreateOffer) {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                socket.emit('offer', { room: roomName, to: userId, offer: offer });
+            }
+        }
+
+        // Button controls
+        document.getElementById('toggleAudio').addEventListener('click', () => {
+            if (!localStream) return;
+            const audioTrack = localStream.getAudioTracks()[0];
+            if (audioTrack) {
+                audioTrack.enabled = !audioTrack.enabled;
+                const btn = document.getElementById('toggleAudio');
+                if (audioTrack.enabled) {
+                    btn.textContent = '🎤 Mute';
+                    btn.classList.remove('bg-red-600');
+                    btn.classList.add('bg-gray-700');
+                } else {
+                    btn.textContent = '🔇 Unmuted';
+                    btn.classList.remove('bg-gray-700');
+                    btn.classList.add('bg-red-600');
+                }
+                console.log('Microphone', audioTrack.enabled ? 'ON' : 'OFF');
+            } else {
+                alert('Microphone not available');
+            }
+        });
+
+        document.getElementById('toggleVideo').addEventListener('click', () => {
+            if (!localStream) return;
+            const videoTrack = localStream.getVideoTracks()[0];
+            if (videoTrack) {
+                videoTrack.enabled = !videoTrack.enabled;
+                const btn = document.getElementById('toggleVideo');
+                if (videoTrack.enabled) {
+                    btn.textContent = '📹 Stop Video';
+                    btn.classList.remove('bg-red-600');
+                    btn.classList.add('bg-gray-700');
+                } else {
+                    btn.textContent = '📹 Start Video';
+                    btn.classList.remove('bg-gray-700');
+                    btn.classList.add('bg-red-600');
+                }
+                console.log('Camera', videoTrack.enabled ? 'ON' : 'OFF');
+            } else {
+                alert('Camera not available');
+            }
+        });
+
+        document.getElementById('hangUp').addEventListener('click', () => {
+            if (confirm('Leave the meeting?')) {
+                Object.values(peerConnections).forEach(pc => pc.close());
+                if (localStream) localStream.getTracks().forEach(track => track.stop());
+                socket.disconnect();
+                window.location.href = '/';
+            }
+        });
+
+        // Start
+        startLocalStream();
+    </script>
+</body>
+</html>

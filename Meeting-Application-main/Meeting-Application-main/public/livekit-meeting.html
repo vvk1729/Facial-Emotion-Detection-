@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LiveKit Meeting</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/livekit-client@1.15.0/dist/livekit-client.umd.min.js"></script>
+</head>
+<body class="bg-gray-900">
+    <div class="video-container bg-gray-900 h-screen flex items-center p-24">
+        <div id="pinned">
+            <video autoplay muted playsinline class="h-128 m-5 local-video border-gray-600 rounded-xl border-4" id="local-video"></video>
+        </div>
+        <div style="border: 1px solid whitesmoke;" class="h-64 mx-6"></div>
+
+        <div id="participants" class="flex justify-center h-128 scrolling-auto" style="width: 60%; flex-wrap: wrap;">
+            <p id="noOneHere" class="text-gray-400 text-lg">Connecting...</p>
+        </div>
+    </div>
+
+    <section class="bg-gray-900">
+        <div class="fixed bottom-0 left-0 z-50 grid w-full h-16 grid-cols-1 px-8 bg-gray-900 border-t border-gray-200 md:grid-cols-3">
+            <div class="items-center justify-center hidden text-gray-500 me-auto md:flex">
+                <span class="text-sm text-gray-400" id="currentTime">12:43 PM</span>
+                <span class="text-sm border-gray-600 text-gray-400 border-l ml-4 pl-4 tracking-wide" id="roomName"></span>
+            </div>
+            <div class="flex items-center justify-center mx-auto">
+                <button id="toggleAudio" class="p-2.5 group rounded-full bg-gray-100 hover:bg-gray-200 me-4">
+                    <svg width="16px" height="16px" viewBox="0 0 24 24" fill="none">
+                        <path d="M12 16C13.6569 16 15 14.6569 15 13V7C15 5.34315 13.6569 4 12 4C10.3431 4 9 5.34315 9 7V13C9 14.6569 10.3431 16 12 16Z" stroke="#616161" stroke-width="2"/>
+                        <path d="M8 13C8 15.7614 10.2386 18 13 18M16 13C16 15.7614 13.7614 18 11 18M12 18V22" stroke="#616161" stroke-width="2"/>
+                    </svg>
+                </button>
+                <button id="toggleVideo" class="p-2.5 bg-gray-100 group rounded-full hover:bg-gray-200 me-4">
+                    <svg width="16px" height="16px" viewBox="0 0 24 24" fill="none">
+                        <path d="M12 16C13.6569 16 15 14.6569 15 13C15 11.3431 13.6569 10 12 10C10.3431 10 9 11.3431 9 13C9 14.6569 10.3431 16 12 16Z" stroke="#616161" stroke-width="2"/>
+                        <path d="M3 16.8V9.2C3 8.0799 3 7.51984 3.21799 7.09202C3.40973 6.71569 3.71569 6.40973 4.09202 6.21799C4.51984 6 5.0799 6 6.2 6H17.8C18.9201 6 19.4802 6 19.908 6.21799C20.2843 6.40973 20.5903 6.71569 20.782 7.09202C21 7.51984 21 8.0799 21 9.2V16.8C21 17.9201 21 18.4802 20.782 18.908C20.5903 19.2843 20.2843 19.5903 19.908 19.782C19.4802 20 18.9201 20 17.8 20H6.2C5.0799 20 4.51984 20 4.09202 19.782C3.71569 19.5903 3.40973 19.2843 3.21799 18.908C3 18.4802 3 17.9201 3 16.8Z" stroke="#616161" stroke-width="2"/>
+                    </svg>
+                </button>
+                <button id="shareScreen" class="p-2.5 bg-gray-100 group rounded-full hover:bg-gray-200 me-4">
+                    <svg width="16px" height="16px" viewBox="0 0 24 24" fill="none">
+                        <path d="M7 3H17C18.1046 3 19 3.89543 19 5V9M7 21H17C18.1046 21 19 20.1046 19 19V15M21 12H3M21 12L18 9M21 12L18 15M3 12L6 15M3 12L6 9" stroke="#616161" stroke-width="2"/>
+                    </svg>
+                </button>
+                <button id="hangUp" class="ml-4 mt-2 text-white bg-red-700 hover:bg-red-800 rounded-full text-sm px-5 py-2.5">
+                    Leave Meeting
+                </button>
+            </div>
+        </div>
+    </section>
+
+    <script>
+        // Wait for LiveKit to load
+        window.addEventListener('load', async () => {
+            const LiveKit = window.LiveKitClient;
+            
+            if (!LiveKit) {
+                document.getElementById('noOneHere').textContent = 'Failed to load LiveKit library';
+                console.error('LiveKit library not loaded');
+                return;
+            }
+
+            let room;
+            let localTracks = {
+                video: null,
+                audio: null
+            };
+
+            // Get meeting info from URL
+            const urlParams = new URLSearchParams(window.location.search);
+            const roomName = urlParams.get('room');
+            const participantName = urlParams.get('name') || 'Guest';
+
+            document.getElementById('roomName').textContent = roomName;
+
+            async function connectToRoom() {
+                try {
+                // Get token from server
+                const response = await fetch('/get-token', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        roomName: roomName,
+                        participantName: participantName
+                    })
+                });
+
+                const data = await response.json();
+                
+                if (!data.token || !data.wsUrl) {
+                    throw new Error('Failed to get access token');
+                }
+
+                // Create room instance
+                room = new LiveKit.Room({
+                    adaptiveStream: true,
+                    dynacast: true,
+                });
+
+                // Set up event listeners
+                room
+                    .on(LiveKit.RoomEvent.TrackSubscribed, handleTrackSubscribed)
+                    .on(LiveKit.RoomEvent.TrackUnsubscribed, handleTrackUnsubscribed)
+                    .on(LiveKit.RoomEvent.ParticipantConnected, handleParticipantConnected)
+                    .on(LiveKit.RoomEvent.ParticipantDisconnected, handleParticipantDisconnected)
+                    .on(LiveKit.RoomEvent.LocalTrackPublished, handleLocalTrackPublished)
+                    .on(LiveKit.RoomEvent.Disconnected, handleDisconnect);
+
+                // Connect to room
+                await room.connect(data.wsUrl, data.token);
+                console.log('Connected to room:', room.name);
+
+                // Publish local audio and video
+                await publishLocalTracks();
+
+                document.getElementById('noOneHere').textContent = 'No one else is here...';
+
+            } catch (error) {
+                console.error('Failed to connect:', error);
+                document.getElementById('noOneHere').textContent = 'Failed to connect: ' + error.message;
+            }
+        }
+
+        async function publishLocalTracks() {
+            try {
+                // Create local tracks
+                localTracks.audio = await LiveKit.createLocalAudioTrack();
+                localTracks.video = await LiveKit.createLocalVideoTrack({
+                    resolution: LiveKit.VideoPresets.h1080.resolution
+                
+                });
+
+                // Attach local video to element
+                const localVideo = document.getElementById('local-video');
+                localTracks.video.attach(localVideo);
+
+                // Publish tracks to room
+                await room.localParticipant.publishTrack(localTracks.audio);
+                await room.localParticipant.publishTrack(localTracks.video);
+
+                console.log('Local tracks published');
+            } catch (error) {
+                console.error('Failed to publish tracks:', error);
+            }
+        }
+
+        function handleTrackSubscribed(track, publication, participant) {
+            const participantDiv = getOrCreateParticipantDiv(participant.identity);
+
+            if (track.kind === 'video') {
+                const videoElement = document.createElement('video');
+                videoElement.id = `video-${participant.identity}`;
+                videoElement.className = 'h-64 m-5 border-gray-600 rounded-xl border-4';
+                videoElement.autoplay = true;
+                videoElement.playsInline = true;
+                
+                track.attach(videoElement);
+                participantDiv.appendChild(videoElement);
+            } else if (track.kind === 'audio') {
+                const audioElement = document.createElement('audio');
+                audioElement.autoplay = true;
+                track.attach(audioElement);
+                participantDiv.appendChild(audioElement);
+            }
+
+            updateParticipantCount();
+        }
+
+        function handleTrackUnsubscribed(track, publication, participant) {
+            track.detach();
+            updateParticipantCount();
+        }
+
+        function handleParticipantConnected(participant) {
+            console.log('Participant connected:', participant.identity);
+            updateParticipantCount();
+        }
+
+        function handleParticipantDisconnected(participant) {
+            console.log('Participant disconnected:', participant.identity);
+            const participantDiv = document.getElementById(`participant-${participant.identity}`);
+            if (participantDiv) {
+                participantDiv.remove();
+            }
+            updateParticipantCount();
+        }
+
+        function handleLocalTrackPublished(publication, participant) {
+            console.log('Local track published:', publication.kind);
+        }
+
+        function handleDisconnect() {
+            console.log('Disconnected from room');
+            window.location.href = '/home';
+        }
+
+        function getOrCreateParticipantDiv(identity) {
+            let div = document.getElementById(`participant-${identity}`);
+            if (!div) {
+                div = document.createElement('div');
+                div.id = `participant-${identity}`;
+                div.className = 'participant-container';
+                document.getElementById('participants').appendChild(div);
+            }
+            return div;
+        }
+
+        function updateParticipantCount() {
+            const participantCount = room ? room.participants.size : 0;
+            const noOneHere = document.getElementById('noOneHere');
+            
+            if (participantCount > 0) {
+                noOneHere.style.display = 'none';
+            } else {
+                noOneHere.style.display = 'block';
+                noOneHere.textContent = 'No one else is here...';
+            }
+        }
+
+        // Toggle audio
+        document.getElementById('toggleAudio').addEventListener('click', async () => {
+            if (localTracks.audio) {
+                const enabled = localTracks.audio.isMuted;
+                await localTracks.audio.setMuted(!enabled);
+                
+                const button = document.getElementById('toggleAudio');
+                button.style.backgroundColor = localTracks.audio.isMuted ? 'red' : '#f3f4f6';
+            }
+        });
+
+        // Toggle video
+        document.getElementById('toggleVideo').addEventListener('click', async () => {
+            if (localTracks.video) {
+                const enabled = localTracks.video.isMuted;
+                await localTracks.video.setMuted(!enabled);
+                
+                const button = document.getElementById('toggleVideo');
+                button.style.backgroundColor = localTracks.video.isMuted ? 'red' : '#f3f4f6';
+            }
+        });
+
+        // Share screen
+        document.getElementById('shareScreen').addEventListener('click', async () => {
+            try {
+                const screenTrack = await LiveKit.createLocalScreenTracks({
+                    audio: true,
+                    resolution: LiveKit.VideoPresets.h1080.resolution
+                });
+
+                await room.localParticipant.publishTrack(screenTrack[0]);
+                
+                screenTrack[0].on('ended', () => {
+                    room.localParticipant.unpublishTrack(screenTrack[0]);
+                });
+            } catch (error) {
+                console.error('Failed to share screen:', error);
+            }
+        });
+
+        // Hang up
+        document.getElementById('hangUp').addEventListener('click', async () => {
+            if (confirm('Do you want to leave the meeting?')) {
+                if (room) {
+                    await room.disconnect();
+                }
+                window.location.href = '/home';
+            }
+        });
+
+            // Update time
+            function updateTime() {
+                document.getElementById('currentTime').textContent = 
+                    new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            }
+
+            updateTime();
+            setInterval(updateTime, 1000);
+
+            // Start connection
+            await connectToRoom();
+
+            // Cleanup on page unload
+            window.addEventListener('beforeunload', () => {
+                if (room) {
+                    room.disconnect();
+                }
+            });
+        }); // End of window.load event
+    </script>
+</body>
+</html>

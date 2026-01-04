@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Host Meeting</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+</head>
+<body class="bg-gray-900">
+    <div class="video-container bg-gray-900 min-h-screen p-2">
+        <!-- <div class="w-full h-screen mx-auto flex flex-col"> -->
+            <div class="w-full h-screen flex flex-col">
+
+            <!-- Host Header -->
+            <div class="bg-slate-700 p-2 rounded-lg flex-shrink-0">
+                <h1 class="text-lg text-white font-bold">🎯 HOST - <span id="roomName" class="text-yellow-300"></span> | Host: <span id="hostName" class="font-bold"></span> | Participants: <span id="participantCount" class="font-bold">1</span>/6</h1>
+                
+                <!-- Join Requests -->
+                <div id="joinRequests" class="mt-1 hidden">
+                    <p class="text-white font-bold mb-1 text-xs">🔔 Join Requests:</p>
+                    <div id="requestsList" class="space-y-1"></div>
+                </div>
+            </div>
+            
+            <!-- Hidden input to store invite link -->
+            <input id="inviteLink" type="hidden" />
+            
+            <!-- Main Content Frame: Video Grid + Buttons Together -->
+            <div class="flex-1 flex flex-col bg-gray-800 rounded-lg mt-2 mb-2 mx-2 p-4 overflow-hidden justify-center">
+                <div id="videoGrid"
+                class="grid grid-cols-3 gap-4 overflow-hidden h-full">
+                    <!-- Videos will be added here dynamically -->
+                </div>
+
+                <!-- All Control Buttons in One Line -->
+                <div class="flex justify-center gap-2 flex-wrap items-center pt-3 flex-shrink-0">
+                <button id="viewHost" class="px-3 py-2 bg-slate-700 text-white rounded-full font-bold text-sm hover:bg-slate-600">
+                    👤 Host View
+                </button>
+                <button id="viewAll" class="px-3 py-2 bg-slate-700 text-white rounded-full text-sm hover:bg-slate-600">
+                    👥 All Participants
+                </button>
+                <button id="muteAll" class="px-3 py-2 bg-slate-700 text-white rounded-full hover:bg-slate-600 text-sm">
+                    🔇 Mute All
+                </button>
+                <button id="toggleAudio" class="px-3 py-2 bg-slate-700 text-white rounded-full hover:bg-slate-600 text-sm">
+                    🎤 Mute
+                </button>
+                <button id="toggleVideo" class="px-3 py-2 bg-slate-700 text-white rounded-full hover:bg-slate-600 text-sm">
+                    📹 Stop Video
+                </button>
+                <button id="shareScreen" class="px-3 py-2 bg-slate-700 text-white rounded-full hover:bg-slate-600 text-sm">
+                    🖥️ Share Screen
+                </button>
+                <button id="detectEmotion" class="px-3 py-2 bg-slate-700 text-white rounded-full hover:bg-slate-600 text-sm">
+                    😊 Detect Emotion
+                </button>
+                <button id="copyLink" class="px-3 py-2 bg-slate-700 text-white rounded-full hover:bg-slate-600 text-sm">
+                    📋 Copy Link
+                </button>
+                <button id="hangUp" class="px-3 py-2 bg-slate-700 text-white rounded-full hover:bg-slate-600 text-sm">
+                    📞 End Meeting
+                </button>
+                </div>
+            </div>
+            
+            <!-- Emotion Display -->
+            <div id="emotionDisplay" class="mt-4 text-center hidden">
+                <div class="bg-gradient-to-r from-purple-600 to-pink-600 p-4 rounded-lg inline-block">
+                    <p class="text-white text-lg font-bold">Your Emotion: <span id="emotionResult" class="text-yellow-300 text-2xl"></span></p>
+                    <p class="text-white text-sm mt-1">Confidence: <span id="emotionConfidence" class="text-yellow-300"></span></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Get room and name from URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const roomName = urlParams.get('room') || 'room-' + Math.random().toString(36).substring(7);
+        const hostName = urlParams.get('name') || 'Host';
+        const isHost = true;
+
+        document.getElementById('roomName').textContent = roomName;
+        document.getElementById('hostName').textContent = hostName;
+
+        // Generate participant link
+        const baseUrl = window.location.origin;
+        const participantLink = `${baseUrl}/participant-meeting.html?room=${roomName}`;
+        document.getElementById('inviteLink').value = participantLink;
+
+        // Copy link button
+        document.getElementById('copyLink').addEventListener('click', () => {
+            const linkInput = document.getElementById('inviteLink');
+            const participantLink = linkInput.value;
+            
+            // Copy to clipboard using modern API
+            navigator.clipboard.writeText(participantLink).then(() => {
+                const btn = document.getElementById('copyLink');
+                const originalText = btn.textContent;
+                btn.textContent = '✅ Copied!';
+                btn.classList.add('bg-green-700');
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.classList.remove('bg-green-700');
+                }, 2000);
+            }).catch(err => {
+                // Fallback for older browsers
+                linkInput.type = 'text';
+                linkInput.select();
+                document.execCommand('copy');
+                linkInput.type = 'hidden';
+                const btn = document.getElementById('copyLink');
+                const originalText = btn.textContent;
+                btn.textContent = '✅ Copied!';
+                setTimeout(() => btn.textContent = originalText, 2000);
+            });
+        });
+
+        // Connect to Socket.IO
+        const socket = io();
+        let localStream;
+        let screenStream;
+        let peerConnections = {};
+        let participants = new Set();
+        let isSharingScreen = false;
+
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        };
+
+        // Get user media
+        async function startLocalStream() {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: true,
+                    audio: true
+                });
+                
+                addVideoElement('local', hostName + ' (HOST)', localStream, true);
+                // participants.add('local');
+                updateParticipantCount();
+                
+                socket.emit('join-room', { room: roomName, name: hostName, isHost: true });
+            } catch (error) {
+                alert('Cannot access camera/microphone: ' + error.message);
+            }
+        }
+
+        function addVideoElement(id, name, stream, isLocal = false) {
+            const existing = document.getElementById('video-' + id);
+            if (existing) existing.remove();
+
+            const videoGrid = document.getElementById('videoGrid');
+            const container = document.createElement('div');
+            container.id = 'video-' + id;
+            // container.className ='relative w-full h-full flex items-center justify-center';
+            // container.className ='relative w-full h-full flex items-center justify-center overflow-hidden';
+            container.className = 'relative w-full aspect-video flex items-center justify-center overflow-hidden';
+
+
+            
+            const video = document.createElement('video');
+            video.autoplay = true;
+            video.playsinline = true;
+            if (isLocal) video.muted = true;
+            // video.className = 'w-full h-full rounded-lg bg-gray-800 border-2 ' + (isLocal && !isSharingScreen ? 'border-purple-600' : isLocal ? 'border-blue-600' : 'border-green-600');
+            // video.style.objectFit = 'cover';
+            // video.className = 'w-full h-full rounded-lg bg-gray-800 border-2 ...';
+            video.className =
+                    'w-full h-full rounded-lg bg-gray-800 border-2 ' +
+                    (isLocal && !isSharingScreen
+                        ? 'border-purple-600'
+                        : isLocal
+                        ? 'border-blue-600'
+                        : 'border-green-600');
+
+            video.style.objectFit = 'contain';
+
+            video.srcObject = stream;
+            
+            const label = document.createElement('div');
+            label.className = 'absolute bottom-1 left-1 bg-black bg-opacity-50 text-white px-2 py-1 rounded text-xs font-bold';
+            label.textContent = name;
+            
+            // Add mute button for participants (host only)
+            if (!isLocal && isHost) {
+                const muteBtn = document.createElement('button');
+                muteBtn.className = 'absolute top-1 right-1 bg-red-600 text-white px-1 py-0.5 rounded text-xs hover:bg-red-700';
+                muteBtn.textContent = '🔇';
+                muteBtn.onclick = () => muteParticipant(id);
+                container.appendChild(muteBtn);
+            }
+            
+            container.appendChild(video);
+            container.appendChild(label);
+            videoGrid.appendChild(container);
+            
+            applyViewMode();
+        }
+
+        function muteParticipant(userId) {
+            socket.emit('mute-participant', { userId });
+        }
+
+        function removeVideoElement(id) {
+            const element = document.getElementById('video-' + id);
+            if (element) element.remove();
+            participants.delete(id);
+            updateParticipantCount();
+        }
+
+        function updateParticipantCount() {
+            // Count: self (1) + remote participants
+            const totalCount = 1 + participants.size;
+            document.getElementById('participantCount').textContent = totalCount;
+        }
+
+        // View state
+        let currentView = 'host'; // 'host' or 'all'
+        let pendingUsers = new Map(); // Store pending join requests
+
+        // Socket handlers
+        socket.on('all-users', async (users) => {
+            console.log('All users in room:', users);
+            for (const user of users) {
+                if (user.id !== socket.id) {
+                    await createPeerConnection(user.id, true);
+                }
+            }
+        });
+
+        socket.on('join-request', (data) => {
+            console.log('Join request from:', data.name);
+            pendingUsers.set(data.userId, data.name);
+            showJoinRequest(data.userId, data.name);
+        });
+
+        socket.on('user-connected', async (data) => {
+            console.log('User connected:', data);
+            await createPeerConnection(data.userId, true);
+        });
+
+        function showJoinRequest(userId, name) {
+            const requestsDiv = document.getElementById('joinRequests');
+            const requestsList = document.getElementById('requestsList');
+            
+            requestsDiv.classList.remove('hidden');
+            
+            const requestItem = document.createElement('div');
+            requestItem.id = 'request-' + userId;
+            requestItem.className = 'bg-white bg-opacity-20 p-2 rounded flex justify-between items-center';
+            requestItem.innerHTML = `
+                <span class="text-white">${name} wants to join</span>
+                <div class="flex gap-2">
+                    <button onclick="approveUser('${userId}')" class="px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700">
+                        ✅ Allow
+                    </button>
+                    <button onclick="denyUser('${userId}')" class="px-3 py-1 bg-red-600 text-white rounded hover:bg-red-700">
+                        ❌ Deny
+                    </button>
+                </div>
+            `;
+            requestsList.appendChild(requestItem);
+        }
+
+        window.approveUser = function(userId) {
+            socket.emit('approve-join', { userId, room: roomName });
+            document.getElementById('request-' + userId)?.remove();
+            pendingUsers.delete(userId);
+            if (pendingUsers.size === 0) {
+                document.getElementById('joinRequests').classList.add('hidden');
+            }
+        };
+
+        window.denyUser = function(userId) {
+            socket.emit('deny-join', { userId });
+            document.getElementById('request-' + userId)?.remove();
+            pendingUsers.delete(userId);
+            if (pendingUsers.size === 0) {
+                document.getElementById('joinRequests').classList.add('hidden');
+            }
+        };
+
+        socket.on('user-disconnected', (userId) => {
+            console.log('User disconnected:', userId);
+            if (peerConnections[userId]) {
+                peerConnections[userId].close();
+                delete peerConnections[userId];
+            }
+            removeVideoElement(userId);
+        });
+
+        socket.on('offer', async (data) => {
+            console.log('Received offer from:', data.from);
+            if (!peerConnections[data.from]) {
+                await createPeerConnection(data.from, false);
+            }
+            await peerConnections[data.from].setRemoteDescription(new RTCSessionDescription(data.offer));
+            const answer = await peerConnections[data.from].createAnswer();
+            await peerConnections[data.from].setLocalDescription(answer);
+            socket.emit('answer', { room: roomName, to: data.from, answer: answer });
+        });
+
+        socket.on('answer', async (data) => {
+            console.log('Received answer from:', data.from);
+            if (peerConnections[data.from]) {
+                await peerConnections[data.from].setRemoteDescription(new RTCSessionDescription(data.answer));
+            }
+        });
+
+        socket.on('ice-candidate', async (data) => {
+            console.log('Received ICE candidate from:', data.from);
+            if (peerConnections[data.from]) {
+                await peerConnections[data.from].addIceCandidate(new RTCIceCandidate(data.candidate));
+            }
+        });
+
+        async function createPeerConnection(userId, shouldCreateOffer) {
+            const pc = new RTCPeerConnection(configuration);
+            peerConnections[userId] = pc;
+            
+            // Add local stream tracks
+            const streamToSend = isSharingScreen ? screenStream : localStream;
+            streamToSend.getTracks().forEach(track => {
+                pc.addTrack(track, streamToSend);
+            });
+
+            // Handle remote stream - use event.streams for complete stream
+            pc.ontrack = (event) => {
+                console.log('Received remote track from:', userId, 'Kind:', event.track.kind);
+                
+                // Use the stream from the event which already has all tracks
+                if (event.streams && event.streams[0]) {
+                    const remoteStream = event.streams[0];
+                    const existingVideo = document.querySelector(`#video-${userId} video`);
+                    
+                    if (!existingVideo) {
+                        addVideoElement(userId, 'Participant', remoteStream, false);
+                        participants.add(userId);
+                        updateParticipantCount();
+                        console.log('Created new video element for participant with stream:', remoteStream.id);
+                    } else {
+                        existingVideo.srcObject = remoteStream;
+                        console.log('Updated stream for user', userId);
+                    }
+                }
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    socket.emit('ice-candidate', { 
+                        room: roomName,
+                        to: userId,
+                        candidate: event.candidate 
+                    });
+                }
+            };
+
+            if (shouldCreateOffer) {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                socket.emit('offer', { room: roomName, to: userId, offer: offer });
+            }
+
+            return pc;
+        }
+
+        // Screen sharing
+        document.getElementById('shareScreen').addEventListener('click', async () => {
+            if (!isSharingScreen) {
+                try {
+                    screenStream = await navigator.mediaDevices.getDisplayMedia({ 
+                        video: true,
+                        audio: true 
+                    });
+                    
+                    // Replace video track in all peer connections
+                    const videoTrack = screenStream.getVideoTracks()[0];
+                    const audioTrack = screenStream.getAudioTracks()[0];
+                    
+                    Object.values(peerConnections).forEach(pc => {
+                        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+                        if (sender) sender.replaceTrack(videoTrack);
+                        
+                        if (audioTrack) {
+                            const audioSender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+                            if (audioSender) audioSender.replaceTrack(audioTrack);
+                        }
+                    });
+                    
+                    // Update local video
+                    const localVideo = document.querySelector('#video-local video');
+                    if (localVideo) {
+                        localVideo.srcObject = screenStream;
+                        localVideo.className = 'rounded-lg bg-gray-800 border-2 border-blue-600';
+                        localVideo.style.maxWidth = '100%';
+                        localVideo.style.maxHeight = '100%';
+                        localVideo.style.objectFit = 'contain';
+                    }
+                    
+                    isSharingScreen = true;
+                    document.getElementById('shareScreen').textContent = '🖥️ Stop Sharing';
+                    document.getElementById('shareScreen').classList.add('bg-red-600');
+                    
+                    // Stop sharing when user clicks stop
+                    videoTrack.onended = () => stopScreenShare();
+                    
+                } catch (error) {
+                    alert('Cannot share screen: ' + error.message);
+                }
+            } else {
+                stopScreenShare();
+            }
+        });
+
+        function stopScreenShare() {
+            if (screenStream) {
+                screenStream.getTracks().forEach(track => track.stop());
+            }
+            
+            // Replace back to camera
+            const videoTrack = localStream.getVideoTracks()[0];
+            const audioTrack = localStream.getAudioTracks()[0];
+            
+            Object.values(peerConnections).forEach(pc => {
+                const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+                if (sender) sender.replaceTrack(videoTrack);
+                
+                const audioSender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+                if (audioSender) audioSender.replaceTrack(audioTrack);
+            });
+            
+            // Update local video
+            const localVideo = document.querySelector('#video-local video');
+            if (localVideo) {
+                localVideo.srcObject = localStream;
+                localVideo.className = 'rounded-lg bg-gray-800 border-2 border-purple-600';
+                localVideo.style.maxWidth = '100%';
+                localVideo.style.maxHeight = '100%';
+                localVideo.style.objectFit = 'contain';
+            }
+            
+            isSharingScreen = false;
+            document.getElementById('shareScreen').textContent = '🖥️ Share Screen';
+            document.getElementById('shareScreen').classList.remove('bg-red-600');
+        }
+
+        // Button controls
+        document.getElementById('toggleAudio').addEventListener('click', () => {
+            if (!localStream) return;
+            const audioTrack = localStream.getAudioTracks()[0];
+            if (audioTrack) {
+                audioTrack.enabled = !audioTrack.enabled;
+                const btn = document.getElementById('toggleAudio');
+                if (audioTrack.enabled) {
+                    btn.textContent = '🎤 Mute';
+                    btn.classList.remove('bg-red-600');
+                    btn.classList.add('bg-gray-700');
+                } else {
+                    btn.textContent = '🔇 Unmuted';
+                    btn.classList.remove('bg-gray-700');
+                    btn.classList.add('bg-red-600');
+                }
+                console.log('Microphone', audioTrack.enabled ? 'ON' : 'OFF');
+            }
+        });
+
+        document.getElementById('toggleVideo').addEventListener('click', () => {
+            if (!localStream) return;
+            const videoTrack = localStream.getVideoTracks()[0];
+            if (videoTrack) {
+                videoTrack.enabled = !videoTrack.enabled;
+                const btn = document.getElementById('toggleVideo');
+                if (videoTrack.enabled) {
+                    btn.textContent = '📹 Stop Video';
+                    btn.classList.remove('bg-red-600');
+                    btn.classList.add('bg-gray-700');
+                } else {
+                    btn.textContent = '📹 Start Video';
+                    btn.classList.remove('bg-gray-700');
+                    btn.classList.add('bg-red-600');
+                }
+                console.log('Camera', videoTrack.enabled ? 'ON' : 'OFF');
+            }
+        });
+
+        document.getElementById('hangUp').addEventListener('click', () => {
+            if (confirm('End meeting for everyone?')) {
+                Object.values(peerConnections).forEach(pc => pc.close());
+                if (localStream) localStream.getTracks().forEach(track => track.stop());
+                if (screenStream) screenStream.getTracks().forEach(track => track.stop());
+                socket.disconnect();
+                window.location.href = '/';
+            }
+        });
+
+        // View switching
+        document.getElementById('viewHost').addEventListener('click', () => {
+            currentView = 'host';
+            document.getElementById('viewHost').className = 'px-3 py-2 bg-slate-700 text-white rounded-full font-bold text-sm hover:bg-slate-600';
+            document.getElementById('viewAll').className = 'px-3 py-2 bg-slate-700 text-white rounded-full text-sm hover:bg-slate-600';
+            applyViewMode();
+        });
+
+        document.getElementById('viewAll').addEventListener('click', () => {
+            currentView = 'all';
+            document.getElementById('viewHost').className = 'px-3 py-2 bg-slate-700 text-white rounded-full font-bold text-sm hover:bg-slate-600';
+            document.getElementById('viewAll').className = 'px-3 py-2 bg-slate-700 text-white rounded-full text-sm hover:bg-slate-600';
+            applyViewMode();
+        });
+
+        document.getElementById('muteAll').addEventListener('click', () => {
+            if (confirm('Mute all participants?')) {
+                socket.emit('mute-all', { room: roomName });
+            }
+        });
+
+        // function applyViewMode() {
+        //     const videos = document.querySelectorAll('[id^="video-"]');
+        //     videos.forEach(video => {
+        //         if (currentView === 'host') {
+        //             // Show only host (local video)
+        //             if (video.id === 'video-local') {
+        //                 video.style.display = 'block';
+        //             } else {
+        //                 video.style.display = 'none';
+        //             }
+        //         } else {
+        //             // Show all videos
+        //             video.style.display = 'block';
+        //         }
+        //     });
+            
+        //     // Adjust grid
+        //     const grid = document.getElementById('videoGrid');
+        //     if (currentView === 'host') {
+        //         grid.className = 'flex-1 grid grid-cols-1 gap-4 my-4 px-6 overflow-hidden';
+        //     } else {
+        //         grid.className = 'flex-1 grid grid-cols-3 gap-4 my-4 px-6 overflow-hidden';
+        //     }
+        // }
+ function applyViewMode() {
+    const grid = document.getElementById('videoGrid');
+    const videos = document.querySelectorAll('[id^="video-"]');
+
+    if (currentView === 'host') {
+        // HOST FULL SCREEN
+        grid.className =
+            'flex-1 grid grid-cols-1 gap-3 mt-2 mb-3 px-8 overflow-hidden';
+        grid.style.height = 'calc(100vh - 260px)';
+
+        videos.forEach(video => {
+            video.style.display =
+                video.id === 'video-local' ? 'flex' : 'none';
+        });
+
+    } else {
+        // ALL PARTICIPANTS
+        grid.className =
+            'flex-1 grid grid-cols-3 gap-3 mt-2 mb-3 px-8 overflow-hidden';
+        grid.style.height = 'calc(100vh - 260px)';
+
+        videos.forEach(video => {
+            video.style.display = 'flex';
+        });
+    }
+}
+
+
+        startLocalStream();
+
+        // ============================================
+        // EMOTION DETECTION FUNCTIONALITY FOR ALL PARTICIPANTS
+        // ============================================
+        const detectEmotionBtn = document.getElementById('detectEmotion');
+        const emotionDisplay = document.getElementById('emotionDisplay');
+        const emotionResult = document.getElementById('emotionResult');
+        const emotionConfidence = document.getElementById('emotionConfidence');
+
+        let isDetectingEmotion = false;
+
+        // Get emotion emoji
+        const getEmotionEmoji = (emotion) => {
+            const emotionEmojis = {
+                'happy': '😊',
+                'sad': '😢',
+                'angry': '😠',
+                'surprise': '😲',
+                'fear': '😨',
+                'disgust': '🤢',
+                'neutral': '😐'
+            };
+            return emotionEmojis[emotion] || '😊';
+        };
+
+        // Check if emotion indicates interest
+        const isInterested = (emotion) => {
+            return ['happy', 'surprise', 'neutral'].includes(emotion.toLowerCase());
+        };
+
+        // Add emotion label to video container (only name, no percentage)
+        const addEmotionLabel = (container, emotion) => {
+            // Remove existing emotion label if any
+            const existingLabel = container.querySelector('.emotion-label');
+            if (existingLabel) {
+                existingLabel.remove();
+            }
+
+            // Create new emotion label (only emoji and name)
+            const label = document.createElement('div');
+            label.className = 'emotion-label absolute top-1 right-1 bg-gradient-to-r from-purple-600 to-pink-600 text-white px-2 py-1 rounded text-xs font-bold shadow-lg';
+            label.innerHTML = `${getEmotionEmoji(emotion)} ${emotion.toUpperCase()}`;
+            container.appendChild(label);
+
+            // Remove after 10 seconds
+            setTimeout(() => {
+                label.remove();
+            }, 10000);
+        };
+
+        // Show interest statistics on the right side
+        const showInterestStats = (interested, notInterested, total) => {
+            // Remove existing stats if any
+            const existingStats = document.getElementById('interestStats');
+            if (existingStats) {
+                existingStats.remove();
+            }
+
+            const interestedPercent = ((interested / total) * 100).toFixed(0);
+            const notInterestedPercent = ((notInterested / total) * 100).toFixed(0);
+
+            // Create stats display on the right side
+            const statsDiv = document.createElement('div');
+            statsDiv.id = 'interestStats';
+            statsDiv.className = 'fixed top-24 right-4 bg-gray-800 border-2 border-slate-600 text-white p-4 rounded-lg shadow-2xl z-50';
+            statsDiv.innerHTML = `
+                <div class="text-center mb-2">
+                    <h3 class="font-bold text-lg">📊 Interest Level</h3>
+                </div>
+                <div class="space-y-2">
+                    <div class="bg-slate-700 p-2 rounded">
+                        <div class="text-xs">😊 Interested</div>
+                        <div class="text-2xl font-bold">${interestedPercent}%</div>
+                    </div>
+                    <div class="bg-slate-700 p-2 rounded">
+                        <div class="text-xs">😔 Not Interested</div>
+                        <div class="text-2xl font-bold">${notInterestedPercent}%</div>
+                    </div>
+                    <div class="text-xs text-gray-400 text-center mt-2">
+                        Total: ${total} participant${total > 1 ? 's' : ''}
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(statsDiv);
+
+            // Auto-remove after 15 seconds
+            setTimeout(() => {
+                statsDiv.remove();
+            }, 15000);
+        };
+
+        detectEmotionBtn.addEventListener('click', async () => {
+            if (isDetectingEmotion) {
+                return;
+            }
+
+            try {
+                isDetectingEmotion = true;
+                detectEmotionBtn.textContent = '⏳ Detecting All...';
+                detectEmotionBtn.disabled = true;
+
+                // Get all video elements (local + remote participants)
+                const allVideoContainers = document.querySelectorAll('#videoGrid > div');
+                let emotionsDetected = 0;
+                let interestedCount = 0;
+                let notInterestedCount = 0;
+
+                for (const container of allVideoContainers) {
+                    const videoElement = container.querySelector('video');
+                    
+                    if (!videoElement || !videoElement.srcObject) {
+                        continue;
+                    }
+
+                    try {
+                        // Create canvas to capture frame - fixed smaller size
+                        const canvas = document.createElement('canvas');
+                        canvas.width = 640;
+                        canvas.height = 480;
+
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+
+                        // Convert to base64 with reduced quality
+                        const imageBase64 = canvas.toDataURL('image/jpeg', 0.7);
+
+                        // Send to backend for emotion detection
+                        const response = await fetch('/detect-emotion', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({ image: imageBase64 })
+                        });
+
+                        const data = await response.json();
+
+                        if (data.success && data.detections && data.detections.length > 0) {
+                            const detection = data.detections[0];
+                            const emotion = detection.primary_emotion;
+                            
+                            // Add emotion label (only name)
+                            addEmotionLabel(container, emotion);
+                            emotionsDetected++;
+
+                            // Count interest levels
+                            if (isInterested(emotion)) {
+                                interestedCount++;
+                            } else {
+                                notInterestedCount++;
+                                
+                                // Send emotion alert to non-interested participant
+                                // Get participant socket ID from container ID (format: 'video-socketId')
+                                const participantSocketId = container.id.replace('video-', '');
+                                
+                                // Only send to remote participants (not yourself)
+                                if (participantSocketId && participantSocketId !== socket.id) {
+                                    socket.emit('send-emotion-alert', {
+                                        room: roomName,
+                                        to: participantSocketId,
+                                        emotion: emotion
+                                    });
+                                    console.log('Sent emotion alert to participant:', participantSocketId, 'emotion:', emotion);
+                                }
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Error detecting emotion for video:', error);
+                    }
+                }
+
+                if (emotionsDetected > 0) {
+                    // Show interest statistics
+                    showInterestStats(interestedCount, notInterestedCount, emotionsDetected);
+                    
+                    emotionResult.textContent = `✓ ${emotionsDetected} participants`;
+                    emotionConfidence.textContent = 'Emotions detected!';
+                    emotionDisplay.classList.remove('hidden');
+                    setTimeout(() => {
+                        emotionDisplay.classList.add('hidden');
+                    }, 3000);
+                } else {
+                    alert('No faces detected in any video!');
+                }
+
+            } catch (error) {
+                console.error('Emotion detection error:', error);
+                alert('Failed to detect emotions. Make sure the emotion detection service is running.');
+            } finally {
+                isDetectingEmotion = false;
+                detectEmotionBtn.textContent = '😊 Detect Emotion';
+                detectEmotionBtn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>
